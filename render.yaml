@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: booking-platform-backend
+    runtime: python
+    rootDir: backend
+    buildCommand: "./build.sh"
+    startCommand: "gunicorn booking_core.wsgi:application"
+    plan: free
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.9.6
+      - key: DEBUG
+        value: "False"
+      - key: SECRET_KEY
+        generateValue: true
+      - key: DATABASE_URL
+        sync: false
