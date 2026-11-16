@@ -5,7 +5,7 @@ from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 from .models import (
     Destination, TourPackage, Hotel, RoomType,
     SeasonalPricing, RoomInventory, GuideProfile, TourSlot,
-    Booking, Review
+    Booking, PaymentTransaction, Invoice, Review
 )
 
 User = get_user_model()
@@ -210,6 +210,30 @@ class TourSlotSerializer(serializers.ModelSerializer):
 
 
 # ----------------------------------------------------
+# Invoices & Payment Serializers
+# ----------------------------------------------------
+
+class InvoiceSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Invoice
+        fields = [
+            'id', 'invoice_number', 'billing_name', 'billing_email',
+            'subtotal', 'tax_rate_percent', 'tax_amount', 'total_amount',
+            'currency', 'is_paid', 'pdf_url', 'issued_at'
+        ]
+
+
+class PaymentTransactionSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = PaymentTransaction
+        fields = [
+            'id', 'booking', 'provider', 'transaction_id',
+            'external_order_id', 'external_payment_id',
+            'amount', 'currency', 'status', 'created_at'
+        ]
+
+
+# ----------------------------------------------------
 # Unified Booking Serializer
 # ----------------------------------------------------
 
@@ -219,6 +243,7 @@ class BookingSerializer(serializers.ModelSerializer):
     tour_title = serializers.CharField(source='tour.title', read_only=True)
     hotel_name = serializers.CharField(source='room_type.hotel.name', read_only=True)
     room_name = serializers.CharField(source='room_type.name', read_only=True)
+    invoice = InvoiceSerializer(read_only=True)
 
     class Meta:
         model = Booking
@@ -229,9 +254,10 @@ class BookingSerializer(serializers.ModelSerializer):
             'customer_name', 'customer_email', 'customer_phone',
             'departure_date', 'check_in_date', 'check_out_date', 'rooms_count',
             'guests_count', 'price_per_person', 'selected_addons',
-            'total_price', 'special_requests', 'status', 'created_at'
+            'total_price', 'special_requests', 'status', 'hold_expires_at',
+            'cancellation_reason', 'refund_amount', 'invoice', 'created_at'
         ]
-        read_only_fields = ['id', 'booking_reference', 'total_price', 'status', 'created_at']
+        read_only_fields = ['id', 'booking_reference', 'total_price', 'status', 'hold_expires_at', 'refund_amount', 'created_at']
 
     def get_item_title(self, obj):
         if obj.tour:
@@ -270,7 +296,6 @@ class BookingSerializer(serializers.ModelSerializer):
             if not quote['is_available']:
                 raise serializers.ValidationError({"room_type": "Selected room is not available for all nights in this date range."})
             
-            # Cache computed total on attrs for create()
             attrs['_computed_total'] = Decimal(str(quote['total_price']))
 
         elif booking_type == 'ACTIVITY':
@@ -314,10 +339,12 @@ class BookingSerializer(serializers.ModelSerializer):
             validated_data['price_per_person'] = price_per_person
             validated_data['total_price'] = total_price
 
-        validated_data['status'] = 'CONFIRMED'
+        # By default create starts in CONFIRMED for direct API, or PENDING_HOLD when hold endpoint is used
+        if 'status' not in validated_data:
+            validated_data['status'] = 'CONFIRMED'
+
         booking = super().create(validated_data)
 
-        # Update slot or inventory booked counters
         if booking.tour_slot:
             slot = booking.tour_slot
             slot.booked_count += guests

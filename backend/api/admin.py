@@ -3,7 +3,7 @@ from django.contrib.auth.admin import UserAdmin as BaseUserAdmin
 from .models import (
     User, Destination, TourPackage, Hotel, RoomType,
     SeasonalPricing, RoomInventory, GuideProfile, TourSlot,
-    Booking, Review
+    Booking, PaymentTransaction, PaymentWebhookLog, Invoice, Review
 )
 
 
@@ -95,10 +95,33 @@ class TourSlotAdmin(admin.ModelAdmin):
 
 @admin.register(Booking)
 class BookingAdmin(admin.ModelAdmin):
-    list_display = ('booking_reference', 'customer_name', 'booking_type', 'user', 'tour', 'room_type', 'status', 'total_price', 'created_at')
+    list_display = ('booking_reference', 'customer_name', 'booking_type', 'user', 'tour', 'room_type', 'status', 'total_price', 'hold_expires_at', 'created_at')
     list_filter = ('booking_type', 'status', 'created_at')
     search_fields = ('booking_reference', 'customer_name', 'customer_email', 'tour__title', 'room_type__name')
     readonly_fields = ('booking_reference', 'created_at')
+
+
+@admin.register(PaymentTransaction)
+class PaymentTransactionAdmin(admin.ModelAdmin):
+    list_display = ('transaction_id', 'booking', 'provider', 'amount', 'currency', 'status', 'created_at')
+    list_filter = ('provider', 'status', 'currency')
+    search_fields = ('transaction_id', 'external_order_id', 'external_payment_id', 'booking__booking_reference')
+    readonly_fields = ('transaction_id', 'created_at', 'updated_at')
+
+
+@admin.register(PaymentWebhookLog)
+class PaymentWebhookLogAdmin(admin.ModelAdmin):
+    list_display = ('event_id', 'provider', 'event_type', 'is_processed', 'created_at')
+    list_filter = ('provider', 'is_processed')
+    search_fields = ('event_id', 'event_type')
+
+
+@admin.register(Invoice)
+class InvoiceAdmin(admin.ModelAdmin):
+    list_display = ('invoice_number', 'booking', 'billing_name', 'total_amount', 'currency', 'is_paid', 'issued_at')
+    list_filter = ('is_paid', 'currency')
+    search_fields = ('invoice_number', 'billing_name', 'billing_email', 'booking__booking_reference')
+    readonly_fields = ('invoice_number', 'issued_at')
 
 
 @admin.register(Review)

@@ -14,8 +14,14 @@ from .views import (
     GuideListAPIView,
     GuideDetailAPIView,
     TourSlotListCreateAPIView,
+    BookingHoldCreateAPIView,
     BookingCreateListAPIView,
     BookingDetailByReferenceAPIView,
+    BookingCancelAPIView,
+    PaymentOrderCreateAPIView,
+    StripeWebhookAPIView,
+    RazorpayWebhookAPIView,
+    InvoiceDetailAPIView,
     TourReviewCreateAPIView,
     StatsOverviewAPIView,
     AdminDashboardAnalyticsAPIView,
@@ -45,9 +51,17 @@ urlpatterns = [
     path('guides/<int:id>/', GuideDetailAPIView.as_view(), name='guide-detail'),
     path('slots/', TourSlotListCreateAPIView.as_view(), name='tour-slot-list-create'),
 
-    # Bookings Engine
+    # Booking Engine & Concurrency Holds
+    path('bookings/hold/', BookingHoldCreateAPIView.as_view(), name='booking-hold'),
     path('bookings/', BookingCreateListAPIView.as_view(), name='booking-create-list'),
     path('bookings/<str:booking_reference>/', BookingDetailByReferenceAPIView.as_view(), name='booking-detail-ref'),
+    path('bookings/<str:booking_reference>/cancel/', BookingCancelAPIView.as_view(), name='booking-cancel'),
+    path('bookings/<str:booking_reference>/invoice/', InvoiceDetailAPIView.as_view(), name='booking-invoice'),
+
+    # Payment Gateways & Webhooks
+    path('payments/create-order/', PaymentOrderCreateAPIView.as_view(), name='payment-create-order'),
+    path('payments/webhook/stripe/', StripeWebhookAPIView.as_view(), name='payment-webhook-stripe'),
+    path('payments/webhook/razorpay/', RazorpayWebhookAPIView.as_view(), name='payment-webhook-razorpay'),
 
     # Platform Metrics & RBAC Analytics
     path('stats/', StatsOverviewAPIView.as_view(), name='platform-stats'),

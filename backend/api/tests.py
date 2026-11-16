@@ -1,12 +1,15 @@
+import json
 from datetime import date, timedelta, time
 from decimal import Decimal
 from django.contrib.auth import get_user_model
 from django.test import TestCase
+from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APIClient
 from .models import (
     Destination, TourPackage, Hotel, RoomType,
-    SeasonalPricing, GuideProfile, TourSlot, Booking
+    SeasonalPricing, GuideProfile, TourSlot, Booking,
+    PaymentTransaction, PaymentWebhookLog, Invoice
 )
 
 User = get_user_model()
@@ -129,9 +132,8 @@ class HotelAndGuideEngineTests(TestCase):
 
     def test_room_availability_quote_and_seasonal_pricing(self):
         start = date.today() + timedelta(days=10)
-        end = start + timedelta(days=3)  # 3 nights
+        end = start + timedelta(days=3)
 
-        # Add a seasonal surge (1.5x) for the middle night
         SeasonalPricing.objects.create(
             room_type=self.room,
             name='Weekend Peak Rush',
@@ -145,12 +147,11 @@ class HotelAndGuideEngineTests(TestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertTrue(response.data['is_available'])
         self.assertEqual(response.data['nights_count'], 3)
-        # Night 1: 500, Night 2: 750 (500 * 1.5), Night 3: 500 => Total = 1750
         self.assertEqual(response.data['total_price'], 1750.0)
 
     def test_hotel_booking_creation(self):
         start = date.today() + timedelta(days=5)
-        end = start + timedelta(days=2)  # 2 nights x 500 = 1000
+        end = start + timedelta(days=2)
 
         payload = {
             'booking_type': 'HOTEL',
@@ -181,7 +182,6 @@ class HotelAndGuideEngineTests(TestCase):
         )
         self.assertEqual(slot.remaining_capacity, 10)
 
-        # Book 4 guests for this slot
         payload = {
             'booking_type': 'ACTIVITY',
             'tour_slot': slot.id,
@@ -193,7 +193,209 @@ class HotelAndGuideEngineTests(TestCase):
         response = self.client.post('/api/bookings/', payload, format='json')
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
 
-        # Verify booked_count updated
         slot.refresh_from_db()
         self.assertEqual(slot.booked_count, 4)
         self.assertEqual(slot.remaining_capacity, 6)
+
+
+class ConcurrencyAndPaymentEngineTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.destination = Destination.objects.create(
+            name='Kyoto',
+            country='Japan',
+            region='Asia',
+            description='Ancient bamboo groves and imperial temples.',
+            image_url='https://example.com/kyoto.jpg'
+        )
+        self.tour = TourPackage.objects.create(
+            destination=self.destination,
+            title='Kyoto Zen Sanctuaries & Tea Ceremony',
+            slug='kyoto-zen-sanctuaries',
+            category='Cultural',
+            price_per_person=Decimal('150.00'),
+            group_size_max=10
+        )
+        self.slot = TourSlot.objects.create(
+            tour=self.tour,
+            slot_date=date.today() + timedelta(days=15),
+            start_time=time(10, 0),
+            max_capacity=2,  # Only 2 seats for testing concurrency limits
+            booked_count=0
+        )
+
+    def test_booking_temporary_hold(self):
+        # Place a 10-minute hold for 1 seat
+        payload = {
+            'booking_type': 'ACTIVITY',
+            'tour_slot': self.slot.id,
+            'customer_name': 'Kenji Sato',
+            'customer_email': 'kenji@example.com',
+            'customer_phone': '+819012345678',
+            'guests_count': 1,
+        }
+        response = self.client.post('/api/bookings/hold/', payload, format='json')
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.data['status'], 'PENDING_HOLD')
+        self.assertEqual(response.data['hold_seconds_remaining'], 600)
+        self.assertIn('booking_reference', response.data)
+
+        # Check slot remaining capacity decremented to 1
+        self.slot.refresh_from_db()
+        self.assertEqual(self.slot.remaining_capacity, 1)
+
+    def test_double_booking_prevention_on_exhausted_slot(self):
+        # User 1 reserves the only 2 available seats
+        payload1 = {
+            'booking_type': 'ACTIVITY',
+            'tour_slot': self.slot.id,
+            'customer_name': 'First Traveller',
+            'customer_email': 'first@example.com',
+            'customer_phone': '+1111111111',
+            'guests_count': 2,
+        }
+        res1 = self.client.post('/api/bookings/hold/', payload1, format='json')
+        self.assertEqual(res1.status_code, status.HTTP_201_CREATED)
+
+        # User 2 attempts to reserve 1 seat at the same time
+        payload2 = {
+            'booking_type': 'ACTIVITY',
+            'tour_slot': self.slot.id,
+            'customer_name': 'Second Traveller',
+            'customer_email': 'second@example.com',
+            'customer_phone': '+2222222222',
+            'guests_count': 1,
+        }
+        res2 = self.client.post('/api/bookings/hold/', payload2, format='json')
+        # Double booking prevented!
+        self.assertEqual(res2.status_code, status.HTTP_409_CONFLICT)
+        self.assertIn('error', res2.data)
+
+    def test_payment_order_creation_stripe_and_razorpay(self):
+        # Create a booking on hold
+        booking = Booking.objects.create(
+            tour=self.tour,
+            booking_type='TOUR',
+            customer_name='Marcus Aurelius',
+            customer_email='marcus@example.com',
+            customer_phone='+3906123456',
+            departure_date=date.today() + timedelta(days=20),
+            guests_count=2,
+            price_per_person=Decimal('150.00'),
+            total_price=Decimal('300.00'),
+            status='PENDING_HOLD',
+            hold_expires_at=timezone.now() + timedelta(minutes=10)
+        )
+
+        # 1. Stripe order creation
+        stripe_res = self.client.post('/api/payments/create-order/', {
+            'booking_reference': booking.booking_reference,
+            'provider': 'STRIPE'
+        })
+        self.assertEqual(stripe_res.status_code, status.HTTP_200_OK)
+        self.assertEqual(stripe_res.data['provider'], 'STRIPE')
+        self.assertIn('client_secret', stripe_res.data)
+
+        # 2. Razorpay order creation
+        rzp_res = self.client.post('/api/payments/create-order/', {
+            'booking_reference': booking.booking_reference,
+            'provider': 'RAZORPAY'
+        })
+        self.assertEqual(rzp_res.status_code, status.HTTP_200_OK)
+        self.assertEqual(rzp_res.data['provider'], 'RAZORPAY')
+        self.assertEqual(rzp_res.data['currency'], 'INR')
+
+    def test_stripe_webhook_confirms_booking_idempotently(self):
+        booking = Booking.objects.create(
+            tour=self.tour,
+            booking_type='TOUR',
+            customer_name='Helena Troy',
+            customer_email='helena@example.com',
+            customer_phone='+3021012345',
+            departure_date=date.today() + timedelta(days=30),
+            guests_count=1,
+            price_per_person=Decimal('150.00'),
+            total_price=Decimal('150.00'),
+            status='PENDING_HOLD',
+            hold_expires_at=timezone.now() + timedelta(minutes=10)
+        )
+
+        event_payload = {
+            'id': 'evt_test_12345_unique',
+            'type': 'payment_intent.succeeded',
+            'data': {
+                'object': {
+                    'id': 'pi_test_charge_999',
+                    'metadata': {
+                        'booking_reference': booking.booking_reference
+                    }
+                }
+            }
+        }
+
+        # First webhook call
+        response = self.client.post(
+            '/api/payments/webhook/stripe/',
+            data=json.dumps(event_payload),
+            content_type='application/json',
+            HTTP_STRIPE_SIGNATURE='test_valid_stripe_signature'
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        booking.refresh_from_db()
+        self.assertEqual(booking.status, 'CONFIRMED')
+        self.assertTrue(hasattr(booking, 'invoice'))
+        self.assertTrue(booking.invoice.is_paid)
+
+        # Second webhook call with same event_id (idempotency guard)
+        response_dup = self.client.post(
+            '/api/payments/webhook/stripe/',
+            data=json.dumps(event_payload),
+            content_type='application/json',
+            HTTP_STRIPE_SIGNATURE='test_valid_stripe_signature'
+        )
+        self.assertEqual(response_dup.status_code, status.HTTP_200_OK)
+        self.assertEqual(response_dup.data['message'], 'Webhook already processed.')
+
+    def test_cancellation_tiered_refund_policy(self):
+        # Case A: > 14 days before start -> 100% refund
+        booking_far = Booking.objects.create(
+            tour=self.tour,
+            customer_name='Far Traveller',
+            customer_email='far@example.com',
+            departure_date=date.today() + timedelta(days=25),
+            total_price=Decimal('500.00'),
+            status='CONFIRMED'
+        )
+        res_far = self.client.post(f"/api/bookings/{booking_far.booking_reference}/cancel/", {'reason': 'Schedule change'})
+        self.assertEqual(res_far.status_code, status.HTTP_200_OK)
+        self.assertEqual(res_far.data['refund_amount'], 500.0)
+        self.assertEqual(res_far.data['status'], 'REFUNDED')
+
+        # Case B: 10 days before start (7-14 range) -> 50% refund
+        booking_mid = Booking.objects.create(
+            tour=self.tour,
+            customer_name='Mid Traveller',
+            customer_email='mid@example.com',
+            departure_date=date.today() + timedelta(days=10),
+            total_price=Decimal('400.00'),
+            status='CONFIRMED'
+        )
+        res_mid = self.client.post(f"/api/bookings/{booking_mid.booking_reference}/cancel/")
+        self.assertEqual(res_mid.status_code, status.HTTP_200_OK)
+        self.assertEqual(res_mid.data['refund_amount'], 200.0)
+        self.assertEqual(res_mid.data['status'], 'REFUNDED')
+
+        # Case C: 2 days before start (< 7 days) -> 0% refund (Non-refundable)
+        booking_close = Booking.objects.create(
+            tour=self.tour,
+            customer_name='Close Traveller',
+            customer_email='close@example.com',
+            departure_date=date.today() + timedelta(days=2),
+            total_price=Decimal('300.00'),
+            status='CONFIRMED'
+        )
+        res_close = self.client.post(f"/api/bookings/{booking_close.booking_reference}/cancel/")
+        self.assertEqual(res_close.status_code, status.HTTP_200_OK)
+        self.assertEqual(res_close.data['refund_amount'], 0.0)
+        self.assertEqual(res_close.data['status'], 'CANCELLED')

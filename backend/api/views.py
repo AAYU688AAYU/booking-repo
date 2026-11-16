@@ -1,10 +1,16 @@
 import json
 import urllib.request
-from datetime import date
+import uuid
+from datetime import date, timedelta
 from decimal import Decimal
+from django.conf import settings
 from django.contrib.auth import get_user_model
+from django.db import transaction
 from django.db.models import Q, Avg, Sum, Count, Min
-from rest_framework import generics, status, permissions
+from django.utils import timezone
+from django.views.decorators.csrf import csrf_exempt
+from django.utils.decorators import method_decorator
+from rest_framework import generics, status, permissions, serializers
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import RefreshToken
@@ -13,9 +19,11 @@ from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
 from .models import (
     Destination, TourPackage, Hotel, RoomType,
     SeasonalPricing, RoomInventory, GuideProfile, TourSlot,
-    Booking, Review
+    Booking, PaymentTransaction, PaymentWebhookLog, Invoice, Review
 )
-from .permissions import IsAdminRole, IsVendorRole, IsGuideRole
+from .permissions import IsAdminRole, IsVendorRole, IsGuideRole, IsOwnerOrAdmin
+from .gateways import get_payment_gateway
+from .invoice_utils import generate_booking_invoice
 from .serializers import (
     CustomTokenObtainPairSerializer,
     UserRegistrationSerializer,
@@ -30,6 +38,8 @@ from .serializers import (
     GuideProfileSerializer,
     TourSlotSerializer,
     BookingSerializer,
+    PaymentTransactionSerializer,
+    InvoiceSerializer,
     ReviewSerializer
 )
 
@@ -41,16 +51,10 @@ User = get_user_model()
 # ----------------------------------------------------
 
 class CustomTokenObtainPairView(TokenObtainPairView):
-    """
-    JWT login endpoint: Returns access & refresh tokens along with user profile metadata.
-    """
     serializer_class = CustomTokenObtainPairSerializer
 
 
 class RegisterAPIView(generics.CreateAPIView):
-    """
-    User registration: Creates account and immediately issues JWT token pair.
-    """
     permission_classes = [permissions.AllowAny]
     serializer_class = UserRegistrationSerializer
 
@@ -59,7 +63,6 @@ class RegisterAPIView(generics.CreateAPIView):
         serializer.is_valid(raise_exception=True)
         user = serializer.save()
 
-        # Generate JWT tokens for immediate login
         refresh = RefreshToken.for_user(user)
         refresh['email'] = user.email
         refresh['full_name'] = user.full_name
@@ -82,9 +85,6 @@ class RegisterAPIView(generics.CreateAPIView):
 
 
 class UserProfileAPIView(generics.RetrieveUpdateAPIView):
-    """
-    Retrieve or update currently authenticated user profile.
-    """
     permission_classes = [permissions.IsAuthenticated]
     serializer_class = UserProfileSerializer
 
@@ -93,10 +93,6 @@ class UserProfileAPIView(generics.RetrieveUpdateAPIView):
 
 
 class GoogleAuthAPIView(APIView):
-    """
-    Google OAuth One-Tap & standard token exchange.
-    Verifies token against Google's tokeninfo API and provisions/logs in user.
-    """
     permission_classes = [permissions.AllowAny]
 
     def post(self, request):
@@ -310,10 +306,6 @@ class HotelDetailAPIView(generics.RetrieveAPIView):
 
 
 class RoomAvailabilityQuoteAPIView(APIView):
-    """
-    Real-time room availability calendar & dynamic pricing calculator.
-    GET /api/hotels/<hotel_id>/rooms/<room_id>/availability/?start_date=2026-12-01&end_date=2026-12-05&rooms=1
-    """
     def get(self, request, hotel_id, room_id):
         try:
             room = RoomType.objects.get(id=room_id, hotel_id=hotel_id)
@@ -381,29 +373,123 @@ class TourSlotListCreateAPIView(generics.ListCreateAPIView):
         return queryset.order_by('slot_date', 'start_time')
 
     def perform_create(self, serializer):
-        # If user has a GuideProfile, associate it automatically
         guide_profile = getattr(self.request.user, 'guide_profile', None)
         serializer.save(guide=guide_profile)
 
 
 # ----------------------------------------------------
-# Bookings Engine Views
+# Concurrency Hold & Booking Engine
 # ----------------------------------------------------
+
+class BookingHoldCreateAPIView(APIView):
+    """
+    Acquires an atomic temporary hold lock (10 mins) on a room, tour, or slot.
+    Uses select_for_update() inside a transaction to prevent double bookings.
+    POST /api/bookings/hold/
+    """
+    def post(self, request):
+        serializer = BookingSerializer(data=request.data)
+        try:
+            serializer.is_valid(raise_exception=True)
+        except serializers.ValidationError as e:
+            if 'room_type' in e.detail or 'tour_slot' in e.detail:
+                err_msg = str(e.detail.get('room_type', e.detail.get('tour_slot', ['Slot unavailable']))[0])
+                return Response({'error': err_msg}, status=status.HTTP_409_CONFLICT)
+            raise e
+
+        booking_type = serializer.validated_data.get('booking_type', 'TOUR')
+        guests = serializer.validated_data.get('guests_count', 1)
+
+        with transaction.atomic():
+            if booking_type == 'HOTEL':
+                room_type = serializer.validated_data['room_type']
+                # Lock RoomType row
+                locked_room = RoomType.objects.select_for_update().get(id=room_type.id)
+                check_in = serializer.validated_data['check_in_date']
+                check_out = serializer.validated_data['check_out_date']
+                rooms_count = serializer.validated_data.get('rooms_count', 1)
+
+                quote = locked_room.calculate_stay_quote(check_in, check_out, rooms_count)
+                if not quote['is_available']:
+                    return Response({'error': 'Room is no longer available for these dates.'}, status=status.HTTP_409_CONFLICT)
+
+                total_price = Decimal(str(quote['total_price']))
+                price_per_person = locked_room.base_price_per_night
+
+            elif booking_type == 'ACTIVITY':
+                slot = serializer.validated_data['tour_slot']
+                # Lock TourSlot row
+                locked_slot = TourSlot.objects.select_for_update().get(id=slot.id)
+                if not locked_slot.is_available or locked_slot.remaining_capacity < guests:
+                    return Response({'error': f'Slot only has {locked_slot.remaining_capacity} seats remaining.'}, status=status.HTTP_409_CONFLICT)
+
+                locked_slot.booked_count += guests
+                locked_slot.save(update_fields=['booked_count'])
+
+                tour = locked_slot.tour
+                price_per_person = tour.price_per_person
+                total_price = price_per_person * guests
+
+            else:
+                tour = serializer.validated_data['tour']
+                locked_tour = TourPackage.objects.select_for_update().get(id=tour.id)
+                if guests > locked_tour.group_size_max:
+                    return Response({'error': f'Exceeds max group size of {locked_tour.group_size_max}.'}, status=status.HTTP_400_BAD_REQUEST)
+
+                price_per_person = locked_tour.price_per_person
+                addons = serializer.validated_data.get('selected_addons', [])
+                addons_total = sum(Decimal(str(a['price'])) for a in addons if isinstance(a, dict) and 'price' in a)
+                total_price = (price_per_person * guests) + (addons_total * guests)
+
+            # Create booking on hold for 10 minutes
+            hold_expiry = timezone.now() + timedelta(minutes=10)
+            user = request.user if request.user and request.user.is_authenticated else None
+
+            booking = Booking.objects.create(
+                user=user,
+                booking_type=booking_type,
+                tour=serializer.validated_data.get('tour'),
+                room_type=serializer.validated_data.get('room_type'),
+                tour_slot=serializer.validated_data.get('tour_slot'),
+                customer_name=serializer.validated_data['customer_name'],
+                customer_email=serializer.validated_data['customer_email'],
+                customer_phone=serializer.validated_data['customer_phone'],
+                departure_date=serializer.validated_data.get('departure_date'),
+                check_in_date=serializer.validated_data.get('check_in_date'),
+                check_out_date=serializer.validated_data.get('check_out_date'),
+                rooms_count=serializer.validated_data.get('rooms_count', 1),
+                guests_count=guests,
+                price_per_person=price_per_person,
+                selected_addons=serializer.validated_data.get('selected_addons', []),
+                total_price=total_price,
+                special_requests=serializer.validated_data.get('special_requests', ''),
+                status='PENDING_HOLD',
+                hold_expires_at=hold_expiry,
+            )
+
+        return Response({
+            'message': 'Slot temporarily reserved. Please complete payment within 10 minutes.',
+            'booking_reference': booking.booking_reference,
+            'status': booking.status,
+            'total_price': float(booking.total_price),
+            'currency': 'USD',
+            'hold_expires_at': booking.hold_expires_at.isoformat(),
+            'hold_seconds_remaining': 600,
+        }, status=status.HTTP_201_CREATED)
+
 
 class BookingCreateListAPIView(generics.ListCreateAPIView):
     serializer_class = BookingSerializer
 
     def get_queryset(self):
         queryset = Booking.objects.select_related(
-            'tour', 'tour__destination', 'room_type', 'room_type__hotel', 'tour_slot'
+            'tour', 'tour__destination', 'room_type', 'room_type__hotel', 'tour_slot', 'invoice'
         ).order_by('-created_at')
         user = self.request.user
         
-        # If logged in as customer, default to their bookings
         if user.is_authenticated and user.role == 'TRAVELLER':
             return queryset.filter(Q(user=user) | Q(customer_email__iexact=user.email))
         
-        # Support search by reference or email
         email = self.request.query_params.get('email', '').strip()
         ref = self.request.query_params.get('reference', '').strip()
         if ref:
@@ -414,9 +500,10 @@ class BookingCreateListAPIView(generics.ListCreateAPIView):
 
     def perform_create(self, serializer):
         if self.request.user and self.request.user.is_authenticated:
-            serializer.save(user=self.request.user)
+            booking = serializer.save(user=self.request.user)
         else:
-            serializer.save()
+            booking = serializer.save()
+        generate_booking_invoice(booking)
 
 
 class BookingDetailByReferenceAPIView(generics.RetrieveAPIView):
@@ -425,9 +512,261 @@ class BookingDetailByReferenceAPIView(generics.RetrieveAPIView):
 
     def get_queryset(self):
         return Booking.objects.select_related(
-            'tour', 'tour__destination', 'room_type', 'room_type__hotel', 'tour_slot'
+            'tour', 'tour__destination', 'room_type', 'room_type__hotel', 'tour_slot', 'invoice'
         ).all()
 
+
+class BookingCancelAPIView(APIView):
+    """
+    Cancels a booking, evaluates tiered refund policy, and triggers refund if applicable.
+    POST /api/bookings/<booking_reference>/cancel/
+    """
+    def post(self, request, booking_reference):
+        try:
+            booking = Booking.objects.select_for_update().get(booking_reference__iexact=booking_reference)
+        except Booking.DoesNotExist:
+            return Response({'error': 'Booking not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        if booking.status in ('CANCELLED', 'REFUNDED'):
+            return Response({'error': f'Booking is already {booking.status.lower()}.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        reason = request.data.get('reason', 'Customer requested cancellation')
+        refund_amount = booking.calculate_cancellation_refund()
+
+        booking.status = 'REFUNDED' if refund_amount > 0 else 'CANCELLED'
+        booking.cancellation_reason = reason
+        booking.refund_amount = refund_amount
+        booking.save()
+
+        # If booking had a tour slot, restore the capacity
+        if booking.tour_slot:
+            slot = booking.tour_slot
+            slot.booked_count = max(0, slot.booked_count - booking.guests_count)
+            slot.save(update_fields=['booked_count'])
+
+        # Process gateway refund if a captured transaction exists
+        captured_tx = booking.payments.filter(status='CAPTURED').first()
+        refund_id = None
+        if captured_tx and refund_amount > 0:
+            gateway = get_payment_gateway(captured_tx.provider)
+            success, refund_res = gateway.process_refund(captured_tx, refund_amount, reason)
+            if success:
+                refund_id = refund_res
+                PaymentTransaction.objects.create(
+                    booking=booking,
+                    provider=captured_tx.provider,
+                    transaction_id=f"tx_rf_{uuid.uuid4().hex[:12]}",
+                    external_order_id=captured_tx.external_order_id,
+                    external_payment_id=refund_id,
+                    amount=-refund_amount,
+                    currency=captured_tx.currency,
+                    status='REFUNDED',
+                    raw_response={'refund_id': refund_id}
+                )
+
+        return Response({
+            'message': 'Booking cancelled successfully.',
+            'booking_reference': booking.booking_reference,
+            'status': booking.status,
+            'refund_amount': float(refund_amount),
+            'cancellation_reason': reason,
+            'refund_id': refund_id,
+        }, status=status.HTTP_200_OK)
+
+
+# ----------------------------------------------------
+# Payment Order & Webhook Views
+# ----------------------------------------------------
+
+class PaymentOrderCreateAPIView(APIView):
+    """
+    Creates Stripe PaymentIntent or Razorpay Order for a booking in PENDING_HOLD.
+    POST /api/payments/create-order/
+    Body: {"booking_reference": "TRV-12345", "provider": "STRIPE" | "RAZORPAY"}
+    """
+    def post(self, request):
+        ref = request.data.get('booking_reference')
+        provider = request.data.get('provider', 'STRIPE').upper()
+
+        if not ref:
+            return Response({'error': 'booking_reference is required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            booking = Booking.objects.get(booking_reference__iexact=ref)
+        except Booking.DoesNotExist:
+            return Response({'error': 'Booking not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        if booking.status not in ('PENDING_HOLD', 'PENDING'):
+            return Response({'error': f'Booking status is {booking.status}. Payment is not required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if booking.is_hold_expired:
+            booking.status = 'CANCELLED'
+            booking.save(update_fields=['status'])
+            return Response({'error': 'Booking hold has expired. Please reserve the dates again.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        gateway = get_payment_gateway(provider)
+        order_info = gateway.create_order(booking)
+
+        # Record pending transaction
+        PaymentTransaction.objects.create(
+            booking=booking,
+            provider=order_info['provider'],
+            transaction_id=f"tx_{uuid.uuid4().hex[:14]}",
+            external_order_id=order_info['order_id'],
+            amount=booking.total_price,
+            currency=order_info['currency'],
+            status='PENDING',
+            raw_response=order_info
+        )
+
+        return Response(order_info, status=status.HTTP_200_OK)
+
+
+@method_decorator(csrf_exempt, name='dispatch')
+class StripeWebhookAPIView(APIView):
+    """
+    Idempotent Stripe Webhook handler.
+    POST /api/payments/webhook/stripe/
+    """
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request):
+        payload_bytes = request.body
+        sig_header = request.headers.get('Stripe-Signature', '')
+
+        gateway = get_payment_gateway('STRIPE')
+        valid, event = gateway.verify_webhook(payload_bytes, sig_header)
+        if not valid:
+            return Response({'error': 'Invalid signature.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        event_id = event.get('id', f"evt_sim_{uuid.uuid4().hex[:12]}")
+        event_type = event.get('type', 'payment_intent.succeeded')
+
+        # Idempotency check
+        if PaymentWebhookLog.objects.filter(event_id=event_id).exists():
+            return Response({'message': 'Webhook already processed.'}, status=status.HTTP_200_OK)
+
+        webhook_log = PaymentWebhookLog.objects.create(
+            event_id=event_id,
+            provider='STRIPE',
+            event_type=event_type,
+            payload=event
+        )
+
+        if event_type in ('payment_intent.succeeded', 'charge.succeeded'):
+            data_obj = event.get('data', {}).get('object', {})
+            ref = data_obj.get('metadata', {}).get('booking_reference')
+            payment_id = data_obj.get('id')
+
+            if ref:
+                with transaction.atomic():
+                    try:
+                        booking = Booking.objects.select_for_update().get(booking_reference__iexact=ref)
+                        booking.status = 'CONFIRMED'
+                        booking.save(update_fields=['status'])
+
+                        # Generate invoice
+                        generate_booking_invoice(booking)
+
+                        # Update transaction status
+                        tx = booking.payments.filter(provider='STRIPE').order_by('-created_at').first()
+                        if tx:
+                            tx.status = 'CAPTURED'
+                            tx.external_payment_id = payment_id or ''
+                            tx.save(update_fields=['status', 'external_payment_id'])
+
+                        webhook_log.is_processed = True
+                        webhook_log.save(update_fields=['is_processed'])
+                    except Booking.DoesNotExist:
+                        pass
+
+        return Response({'received': True}, status=status.HTTP_200_OK)
+
+
+@method_decorator(csrf_exempt, name='dispatch')
+class RazorpayWebhookAPIView(APIView):
+    """
+    Idempotent Razorpay Webhook handler.
+    POST /api/payments/webhook/razorpay/
+    """
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request):
+        payload_bytes = request.body
+        sig_header = request.headers.get('X-Razorpay-Signature', '')
+
+        gateway = get_payment_gateway('RAZORPAY')
+        valid, event = gateway.verify_webhook(payload_bytes, sig_header)
+        if not valid:
+            return Response({'error': 'Invalid signature.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        event_id = event.get('id', f"evt_sim_{uuid.uuid4().hex[:12]}")
+        event_type = event.get('event', 'payment.captured')
+
+        if PaymentWebhookLog.objects.filter(event_id=event_id).exists():
+            return Response({'message': 'Webhook already processed.'}, status=status.HTTP_200_OK)
+
+        webhook_log = PaymentWebhookLog.objects.create(
+            event_id=event_id,
+            provider='RAZORPAY',
+            event_type=event_type,
+            payload=event
+        )
+
+        if event_type in ('payment.captured', 'order.paid'):
+            payment_entity = event.get('payload', {}).get('payment', {}).get('entity', {})
+            ref = payment_entity.get('notes', {}).get('booking_reference')
+            payment_id = payment_entity.get('id')
+
+            if ref:
+                with transaction.atomic():
+                    try:
+                        booking = Booking.objects.select_for_update().get(booking_reference__iexact=ref)
+                        booking.status = 'CONFIRMED'
+                        booking.save(update_fields=['status'])
+
+                        generate_booking_invoice(booking)
+
+                        tx = booking.payments.filter(provider='RAZORPAY').order_by('-created_at').first()
+                        if tx:
+                            tx.status = 'CAPTURED'
+                            tx.external_payment_id = payment_id or ''
+                            tx.save(update_fields=['status', 'external_payment_id'])
+
+                        webhook_log.is_processed = True
+                        webhook_log.save(update_fields=['is_processed'])
+                    except Booking.DoesNotExist:
+                        pass
+
+        return Response({'received': True}, status=status.HTTP_200_OK)
+
+
+class InvoiceDetailAPIView(APIView):
+    """
+    Retrieves tax invoice & digital boarding pass receipt for a booking.
+    GET /api/bookings/<booking_reference>/invoice/
+    """
+    def get(self, request, booking_reference):
+        try:
+            booking = Booking.objects.select_related('tour', 'room_type__hotel', 'invoice').get(
+                booking_reference__iexact=booking_reference
+            )
+        except Booking.DoesNotExist:
+            return Response({'error': 'Booking not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        invoice = generate_booking_invoice(booking)
+        serializer = InvoiceSerializer(invoice)
+        data = serializer.data
+        data['booking_reference'] = booking.booking_reference
+        data['customer_name'] = booking.customer_name
+        data['status'] = booking.status
+        data['item_title'] = booking.tour.title if booking.tour else (booking.room_type.hotel.name if booking.room_type else "Voyage Reservation")
+        return Response(data, status=status.HTTP_200_OK)
+
+
+# ----------------------------------------------------
+# General Views & Reviews
+# ----------------------------------------------------
 
 class TourReviewCreateAPIView(APIView):
     def post(self, request, tour_id):
@@ -479,22 +818,14 @@ class StatsOverviewAPIView(APIView):
         })
 
 
-# ----------------------------------------------------
-# Role-based Analytics & Dashboard Views (RBAC)
-# ----------------------------------------------------
-
 class AdminDashboardAnalyticsAPIView(APIView):
-    """
-    Platform admin metrics: GMV, booking velocity, user roles distribution.
-    Requires ADMIN role or staff status.
-    """
     permission_classes = [IsAdminRole]
 
     def get(self, request):
         total_revenue = Booking.objects.filter(status='CONFIRMED').aggregate(Sum('total_price'))['total_price__sum'] or Decimal(0)
         confirmed_bookings = Booking.objects.filter(status='CONFIRMED').count()
-        pending_bookings = Booking.objects.filter(status='PENDING').count()
-        cancelled_bookings = Booking.objects.filter(status='CANCELLED').count()
+        pending_bookings = Booking.objects.filter(status__in=['PENDING_HOLD', 'PAYMENT_PROCESSING']).count()
+        cancelled_bookings = Booking.objects.filter(status__in=['CANCELLED', 'REFUNDED']).count()
 
         roles_breakdown = dict(User.objects.values('role').annotate(count=Count('id')).values_list('role', 'count'))
 

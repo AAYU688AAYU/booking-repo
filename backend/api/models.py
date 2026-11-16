@@ -1,15 +1,22 @@
 import random
 import string
-from datetime import date, timedelta
+from datetime import date, timedelta, time
 from decimal import Decimal
 from django.conf import settings
 from django.contrib.auth.models import AbstractUser, BaseUserManager
 from django.db import models
+from django.utils import timezone
 
 
 def generate_booking_reference():
     digits = ''.join(random.choices(string.digits, k=5))
     return f"TRV-{digits}"
+
+
+def generate_invoice_number():
+    year = date.today().year
+    digits = ''.join(random.choices(string.digits, k=5))
+    return f"INV-{year}-{digits}"
 
 
 class UserManager(BaseUserManager):
@@ -141,7 +148,7 @@ class Hotel(models.Model):
     description = models.TextField()
     image_url = models.URLField(max_length=500)
     gallery_urls = models.JSONField(default=list, blank=True)
-    amenities = models.JSONField(default=list, blank=True)  # e.g. ["Free WiFi", "Infinity Pool", "Spa", "Valet Parking"]
+    amenities = models.JSONField(default=list, blank=True)
     check_in_time = models.CharField(max_length=50, default='14:00')
     check_out_time = models.CharField(max_length=50, default='11:00')
     is_featured = models.BooleanField(default=False)
@@ -158,7 +165,7 @@ class Hotel(models.Model):
 
 class RoomType(models.Model):
     hotel = models.ForeignKey(Hotel, on_delete=models.CASCADE, related_name='room_types')
-    name = models.CharField(max_length=150)  # e.g., "Deluxe Ocean Suite", "Presidential King"
+    name = models.CharField(max_length=150)
     slug = models.SlugField(max_length=200)
     description = models.TextField(blank=True)
     max_occupancy = models.PositiveIntegerField(default=2)
@@ -176,10 +183,6 @@ class RoomType(models.Model):
         return f"{self.hotel.name} - {self.name}"
 
     def calculate_stay_quote(self, start_date: date, end_date: date, requested_rooms: int = 1):
-        """
-        Calculates day-by-day availability and dynamic price across date range.
-        Returns dict with: is_available, available_rooms, total_price, nightly_breakdown
-        """
         if start_date >= end_date:
             return {'is_available': False, 'error': 'Checkout date must be after check-in date.'}
 
@@ -189,13 +192,11 @@ class RoomType(models.Model):
         total_price = Decimal('0.00')
         min_available = self.total_rooms
 
-        # Fetch seasonal pricing rules that overlap with range
         seasonal_rules = list(self.seasonal_prices.filter(
             start_date__lte=end_date,
             end_date__gte=start_date
         ))
 
-        # Fetch daily inventory entries
         inventory_map = {
             inv.date: inv for inv in self.daily_inventory.filter(
                 date__gte=start_date,
@@ -214,7 +215,6 @@ class RoomType(models.Model):
             else:
                 min_available = min(min_available, available)
 
-            # Determine daily price (seasonal multiplier or fixed price)
             day_price = self.base_price_per_night
             active_season = None
             for season in seasonal_rules:
@@ -251,7 +251,7 @@ class RoomType(models.Model):
 
 class SeasonalPricing(models.Model):
     room_type = models.ForeignKey(RoomType, on_delete=models.CASCADE, related_name='seasonal_prices')
-    name = models.CharField(max_length=100)  # e.g., "Peak Summer Season", "Holiday Surge"
+    name = models.CharField(max_length=100)
     start_date = models.DateField()
     end_date = models.DateField()
     price_multiplier = models.DecimalField(max_digits=4, decimal_places=2, default=Decimal('1.00'))
@@ -285,7 +285,7 @@ class GuideProfile(models.Model):
     user = models.OneToOneField(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='guide_profile')
     bio = models.TextField()
     license_number = models.CharField(max_length=100, blank=True)
-    spoken_languages = models.JSONField(default=list, blank=True)  # e.g. ["English", "Spanish", "French"]
+    spoken_languages = models.JSONField(default=list, blank=True)
     experience_years = models.PositiveIntegerField(default=3)
     rating = models.FloatField(default=5.0)
     review_count = models.PositiveIntegerField(default=0)
@@ -323,14 +323,17 @@ class TourSlot(models.Model):
 
 
 # ----------------------------------------------------
-# Unified Booking Model
+# Unified Booking Model with Concurrency & Hold Logic
 # ----------------------------------------------------
 
 class Booking(models.Model):
     STATUS_CHOICES = [
-        ('CONFIRMED', 'Confirmed'),
-        ('PENDING', 'Pending Payment'),
+        ('PENDING_HOLD', 'Temporary Hold (10 mins)'),
+        ('PAYMENT_PROCESSING', 'Payment Processing'),
+        ('CONFIRMED', 'Confirmed & Ticket Issued'),
         ('CANCELLED', 'Cancelled'),
+        ('REFUNDED', 'Refunded'),
+        ('COMPLETED', 'Completed Expedition'),
     ]
 
     BOOKING_TYPE_CHOICES = [
@@ -361,7 +364,10 @@ class Booking(models.Model):
     selected_addons = models.JSONField(default=list, blank=True)
     total_price = models.DecimalField(max_digits=10, decimal_places=2)
     special_requests = models.TextField(blank=True, default='')
-    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='CONFIRMED')
+    status = models.CharField(max_length=30, choices=STATUS_CHOICES, default='CONFIRMED')
+    hold_expires_at = models.DateTimeField(null=True, blank=True)
+    cancellation_reason = models.TextField(blank=True, default='')
+    refund_amount = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'))
     created_at = models.DateTimeField(auto_now_add=True)
 
     def save(self, *args, **kwargs):
@@ -375,7 +381,112 @@ class Booking(models.Model):
 
     def __str__(self):
         title = self.tour.title if self.tour else (self.room_type.hotel.name if self.room_type else "Booking")
-        return f"{self.booking_reference} - {self.customer_name} ({title})"
+        return f"{self.booking_reference} - {self.customer_name} ({title}) [{self.status}]"
+
+    @property
+    def is_hold_expired(self):
+        if self.status == 'PENDING_HOLD' and self.hold_expires_at:
+            return timezone.now() > self.hold_expires_at
+        return False
+
+    def calculate_cancellation_refund(self, cancel_date=None):
+        """
+        Evaluates tiered cancellation policy based on trip start date:
+        > 14 days before start: 100% refund
+        7 - 14 days before start: 50% refund
+        < 7 days before start: 0% refund
+        """
+        start = self.check_in_date if self.booking_type == 'HOTEL' else self.departure_date
+        if not start:
+            return Decimal('0.00')
+
+        if cancel_date is None:
+            cancel_date = date.today()
+
+        days_before = (start - cancel_date).days
+        if days_before > 14:
+            return self.total_price  # 100%
+        elif 7 <= days_before <= 14:
+            return (self.total_price * Decimal('0.50')).quantize(Decimal('0.01'))  # 50%
+        else:
+            return Decimal('0.00')  # Non-refundable
+
+
+# ----------------------------------------------------
+# Payment Processing & Webhooks Models
+# ----------------------------------------------------
+
+class PaymentTransaction(models.Model):
+    PROVIDER_CHOICES = [
+        ('STRIPE', 'Stripe'),
+        ('RAZORPAY', 'Razorpay'),
+        ('SIMULATED', 'Simulated Gateway'),
+    ]
+
+    STATUS_CHOICES = [
+        ('PENDING', 'Pending'),
+        ('PROCESSING', 'Processing'),
+        ('CAPTURED', 'Captured / Succeeded'),
+        ('FAILED', 'Failed'),
+        ('REFUNDED', 'Refunded'),
+    ]
+
+    booking = models.ForeignKey(Booking, on_delete=models.CASCADE, related_name='payments')
+    provider = models.CharField(max_length=20, choices=PROVIDER_CHOICES, default='STRIPE')
+    transaction_id = models.CharField(max_length=200, unique=True)
+    external_order_id = models.CharField(max_length=200, blank=True)
+    external_payment_id = models.CharField(max_length=200, blank=True)
+    amount = models.DecimalField(max_digits=12, decimal_places=2)
+    currency = models.CharField(max_length=10, default='USD')
+    status = models.CharField(max_length=30, choices=STATUS_CHOICES, default='PENDING')
+    raw_response = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"{self.provider} {self.transaction_id} - ${self.amount} ({self.status})"
+
+
+class PaymentWebhookLog(models.Model):
+    """
+    Guarantees strict idempotency for payment webhooks.
+    """
+    event_id = models.CharField(max_length=200, unique=True)
+    provider = models.CharField(max_length=20)
+    event_type = models.CharField(max_length=100)
+    payload = models.JSONField(default=dict)
+    is_processed = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"{self.provider} Event {self.event_id} ({self.event_type})"
+
+
+class Invoice(models.Model):
+    invoice_number = models.CharField(max_length=50, unique=True, editable=False)
+    booking = models.OneToOneField(Booking, on_delete=models.CASCADE, related_name='invoice')
+    billing_name = models.CharField(max_length=150)
+    billing_email = models.EmailField()
+    subtotal = models.DecimalField(max_digits=12, decimal_places=2)
+    tax_rate_percent = models.DecimalField(max_digits=5, decimal_places=2, default=Decimal('5.00'))
+    tax_amount = models.DecimalField(max_digits=12, decimal_places=2)
+    total_amount = models.DecimalField(max_digits=12, decimal_places=2)
+    currency = models.CharField(max_length=10, default='USD')
+    is_paid = models.BooleanField(default=False)
+    pdf_url = models.URLField(max_length=500, blank=True)
+    issued_at = models.DateTimeField(auto_now_add=True)
+
+    def save(self, *args, **kwargs):
+        if not self.invoice_number:
+            while True:
+                inv = generate_invoice_number()
+                if not Invoice.objects.filter(invoice_number=inv).exists():
+                    self.invoice_number = inv
+                    break
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"{self.invoice_number} - {self.billing_name} (${self.total_amount})"
 
 
 class Review(models.Model):

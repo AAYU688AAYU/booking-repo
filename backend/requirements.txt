@@ -8,4 +8,6 @@ whitenoise[brotli]>=6.6.0
 asgiref>=3.7.0
 sqlparse>=0.5.0
 djangorestframework-simplejwt>=5.3.0
+stripe>=11.0.0
+razorpay>=2.0.0
 
