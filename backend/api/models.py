@@ -1,11 +1,65 @@
 import random
 import string
+from django.conf import settings
+from django.contrib.auth.models import AbstractUser, BaseUserManager
 from django.db import models
 
 
 def generate_booking_reference():
     digits = ''.join(random.choices(string.digits, k=5))
     return f"TRV-{digits}"
+
+
+class UserManager(BaseUserManager):
+    def create_user(self, email, password=None, **extra_fields):
+        if not email:
+            raise ValueError('Email address is required')
+        email = self.normalize_email(email)
+        user = self.model(email=email, **extra_fields)
+        if password:
+            user.set_password(password)
+        else:
+            user.set_unusable_password()
+        user.save(using=self._db)
+        return user
+
+    def create_superuser(self, email, password=None, **extra_fields):
+        extra_fields.setdefault('is_staff', True)
+        extra_fields.setdefault('is_superuser', True)
+        extra_fields.setdefault('role', 'ADMIN')
+
+        if extra_fields.get('is_staff') is not True:
+            raise ValueError('Superuser must have is_staff=True.')
+        if extra_fields.get('is_superuser') is not True:
+            raise ValueError('Superuser must have is_superuser=True.')
+
+        return self.create_user(email, password, **extra_fields)
+
+
+class User(AbstractUser):
+    ROLE_CHOICES = [
+        ('TRAVELLER', 'Traveller'),
+        ('VENDOR', 'Hotel & Accommodation Vendor'),
+        ('GUIDE', 'Tour Guide'),
+        ('ADMIN', 'Platform Administrator'),
+    ]
+
+    username = None  # Use email as unique identifier
+    email = models.EmailField(unique=True)
+    full_name = models.CharField(max_length=150, blank=True)
+    phone_number = models.CharField(max_length=30, blank=True)
+    role = models.CharField(max_length=20, choices=ROLE_CHOICES, default='TRAVELLER')
+    is_verified = models.BooleanField(default=False)
+    avatar_url = models.URLField(max_length=500, blank=True)
+    google_id = models.CharField(max_length=255, blank=True, null=True, unique=True)
+
+    objects = UserManager()
+
+    USERNAME_FIELD = 'email'
+    REQUIRED_FIELDS = []
+
+    def __str__(self):
+        return f"{self.email} ({self.role})"
 
 
 class Destination(models.Model):
@@ -79,6 +133,7 @@ class Booking(models.Model):
     ]
 
     booking_reference = models.CharField(max_length=20, unique=True, editable=False)
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name='bookings')
     tour = models.ForeignKey(TourPackage, on_delete=models.CASCADE, related_name='bookings')
     customer_name = models.CharField(max_length=150)
     customer_email = models.EmailField()
@@ -94,7 +149,6 @@ class Booking(models.Model):
 
     def save(self, *args, **kwargs):
         if not self.booking_reference:
-            # Ensure unique reference code
             while True:
                 ref = generate_booking_reference()
                 if not Booking.objects.filter(booking_reference=ref).exists():
@@ -115,6 +169,7 @@ class Review(models.Model):
     ]
 
     tour = models.ForeignKey(TourPackage, on_delete=models.CASCADE, related_name='reviews')
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name='reviews')
     author_name = models.CharField(max_length=120)
     author_avatar = models.URLField(max_length=500, blank=True)
     author_country = models.CharField(max_length=100, blank=True, default='Global Citizen')

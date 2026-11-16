@@ -1,6 +1,68 @@
 from decimal import Decimal
+from django.contrib.auth import get_user_model
 from rest_framework import serializers
+from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 from .models import Destination, TourPackage, Booking, Review
+
+User = get_user_model()
+
+
+class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
+    @classmethod
+    def get_token(cls, user):
+        token = super().get_token(user)
+        token['email'] = user.email
+        token['full_name'] = user.full_name
+        token['role'] = user.role
+        token['is_verified'] = user.is_verified
+        token['avatar_url'] = user.avatar_url
+        return token
+
+    def validate(self, attrs):
+        data = super().validate(attrs)
+        data['user'] = {
+            'id': self.user.id,
+            'email': self.user.email,
+            'full_name': self.user.full_name,
+            'role': self.user.role,
+            'phone_number': self.user.phone_number,
+            'is_verified': self.user.is_verified,
+            'avatar_url': self.user.avatar_url,
+        }
+        return data
+
+
+class UserRegistrationSerializer(serializers.ModelSerializer):
+    password = serializers.CharField(write_only=True, min_length=8)
+    password_confirm = serializers.CharField(write_only=True, min_length=8)
+
+    class Meta:
+        model = User
+        fields = ['id', 'email', 'password', 'password_confirm', 'full_name', 'phone_number', 'role']
+        read_only_fields = ['id']
+
+    def validate(self, attrs):
+        if attrs['password'] != attrs['password_confirm']:
+            raise serializers.ValidationError({"password_confirm": "Passwords do not match."})
+        return attrs
+
+    def create(self, validated_data):
+        validated_data.pop('password_confirm')
+        password = validated_data.pop('password')
+        user = User.objects.create_user(password=password, **validated_data)
+        return user
+
+
+class UserProfileSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = User
+        fields = ['id', 'email', 'full_name', 'phone_number', 'role', 'is_verified', 'avatar_url', 'date_joined']
+        read_only_fields = ['id', 'email', 'role', 'is_verified', 'date_joined']
+
+
+class GoogleAuthSerializer(serializers.Serializer):
+    credential = serializers.CharField(required=True)
+    role = serializers.CharField(required=False, default='TRAVELLER')
 
 
 class ReviewSerializer(serializers.ModelSerializer):
@@ -9,7 +71,7 @@ class ReviewSerializer(serializers.ModelSerializer):
     class Meta:
         model = Review
         fields = [
-            'id', 'tour', 'author_name', 'author_avatar',
+            'id', 'tour', 'user', 'author_name', 'author_avatar',
             'author_country', 'travel_type', 'rating',
             'title', 'comment', 'created_at', 'created_at_formatted'
         ]
@@ -68,7 +130,7 @@ class BookingSerializer(serializers.ModelSerializer):
     class Meta:
         model = Booking
         fields = [
-            'id', 'booking_reference', 'tour', 'tour_title', 'tour_destination', 'tour_image',
+            'id', 'booking_reference', 'user', 'tour', 'tour_title', 'tour_destination', 'tour_image',
             'tour_duration', 'customer_name', 'customer_email', 'customer_phone',
             'departure_date', 'guests_count', 'price_per_person', 'selected_addons',
             'total_price', 'special_requests', 'status', 'created_at'
