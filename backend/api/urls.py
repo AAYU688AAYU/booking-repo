@@ -8,6 +8,12 @@ from .views import (
     DestinationListAPIView,
     TourPackageListAPIView,
     TourPackageDetailAPIView,
+    HotelListCreateAPIView,
+    HotelDetailAPIView,
+    RoomAvailabilityQuoteAPIView,
+    GuideListAPIView,
+    GuideDetailAPIView,
+    TourSlotListCreateAPIView,
     BookingCreateListAPIView,
     BookingDetailByReferenceAPIView,
     TourReviewCreateAPIView,
@@ -28,6 +34,16 @@ urlpatterns = [
     path('trips/', TourPackageListAPIView.as_view(), name='trip-list'),
     path('trips/<int:id>/', TourPackageDetailAPIView.as_view(), name='trip-detail'),
     path('trips/<int:tour_id>/reviews/', TourReviewCreateAPIView.as_view(), name='trip-add-review'),
+
+    # Hotels & Accommodations
+    path('hotels/', HotelListCreateAPIView.as_view(), name='hotel-list-create'),
+    path('hotels/<int:id>/', HotelDetailAPIView.as_view(), name='hotel-detail'),
+    path('hotels/<int:hotel_id>/rooms/<int:room_id>/availability/', RoomAvailabilityQuoteAPIView.as_view(), name='room-availability-quote'),
+
+    # Tour Guides & Activities
+    path('guides/', GuideListAPIView.as_view(), name='guide-list'),
+    path('guides/<int:id>/', GuideDetailAPIView.as_view(), name='guide-detail'),
+    path('slots/', TourSlotListCreateAPIView.as_view(), name='tour-slot-list-create'),
 
     # Bookings Engine
     path('bookings/', BookingCreateListAPIView.as_view(), name='booking-create-list'),

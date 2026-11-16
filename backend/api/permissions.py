@@ -52,3 +52,4 @@ class IsOwnerOrAdmin(permissions.BasePermission):
         if hasattr(obj, 'customer_email'):
             return obj.customer_email == request.user.email
         return obj == request.user
+

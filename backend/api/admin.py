@@ -1,6 +1,10 @@
 from django.contrib import admin
 from django.contrib.auth.admin import UserAdmin as BaseUserAdmin
-from .models import User, Destination, TourPackage, Booking, Review
+from .models import (
+    User, Destination, TourPackage, Hotel, RoomType,
+    SeasonalPricing, RoomInventory, GuideProfile, TourSlot,
+    Booking, Review
+)
 
 
 @admin.register(User)
@@ -38,16 +42,67 @@ class TourPackageAdmin(admin.ModelAdmin):
     prepopulated_fields = {'slug': ('title',)}
 
 
+class RoomTypeInline(admin.TabularInline):
+    model = RoomType
+    extra = 1
+    prepopulated_fields = {'slug': ('name',)}
+
+
+@admin.register(Hotel)
+class HotelAdmin(admin.ModelAdmin):
+    list_display = ('name', 'destination', 'owner', 'star_rating', 'is_featured', 'created_at')
+    list_filter = ('star_rating', 'is_featured', 'destination__region')
+    search_fields = ('name', 'destination__name', 'destination__country', 'address')
+    prepopulated_fields = {'slug': ('name',)}
+    inlines = [RoomTypeInline]
+
+
+@admin.register(RoomType)
+class RoomTypeAdmin(admin.ModelAdmin):
+    list_display = ('name', 'hotel', 'base_price_per_night', 'max_occupancy', 'total_rooms', 'bed_type')
+    list_filter = ('hotel', 'max_occupancy')
+    search_fields = ('name', 'hotel__name')
+    prepopulated_fields = {'slug': ('name',)}
+
+
+@admin.register(SeasonalPricing)
+class SeasonalPricingAdmin(admin.ModelAdmin):
+    list_display = ('name', 'room_type', 'start_date', 'end_date', 'price_multiplier', 'fixed_price')
+    list_filter = ('start_date', 'end_date')
+    search_fields = ('name', 'room_type__name', 'room_type__hotel__name')
+
+
+@admin.register(RoomInventory)
+class RoomInventoryAdmin(admin.ModelAdmin):
+    list_display = ('room_type', 'date', 'booked_rooms', 'is_blocked')
+    list_filter = ('date', 'is_blocked')
+    search_fields = ('room_type__name', 'room_type__hotel__name')
+
+
+@admin.register(GuideProfile)
+class GuideProfileAdmin(admin.ModelAdmin):
+    list_display = ('user', 'rating', 'experience_years', 'is_verified', 'created_at')
+    list_filter = ('is_verified', 'rating')
+    search_fields = ('user__full_name', 'user__email', 'bio')
+
+
+@admin.register(TourSlot)
+class TourSlotAdmin(admin.ModelAdmin):
+    list_display = ('tour', 'guide', 'slot_date', 'start_time', 'booked_count', 'max_capacity', 'is_active')
+    list_filter = ('slot_date', 'is_active')
+    search_fields = ('tour__title', 'guide__user__full_name')
+
+
 @admin.register(Booking)
 class BookingAdmin(admin.ModelAdmin):
-    list_display = ('booking_reference', 'customer_name', 'user', 'tour', 'departure_date', 'guests_count', 'total_price', 'status', 'created_at')
-    list_filter = ('status', 'departure_date')
-    search_fields = ('booking_reference', 'customer_name', 'customer_email', 'tour__title')
+    list_display = ('booking_reference', 'customer_name', 'booking_type', 'user', 'tour', 'room_type', 'status', 'total_price', 'created_at')
+    list_filter = ('booking_type', 'status', 'created_at')
+    search_fields = ('booking_reference', 'customer_name', 'customer_email', 'tour__title', 'room_type__name')
     readonly_fields = ('booking_reference', 'created_at')
 
 
 @admin.register(Review)
 class ReviewAdmin(admin.ModelAdmin):
-    list_display = ('author_name', 'tour', 'user', 'rating', 'travel_type', 'created_at')
+    list_display = ('author_name', 'tour', 'hotel', 'user', 'rating', 'travel_type', 'created_at')
     list_filter = ('rating', 'travel_type')
-    search_fields = ('author_name', 'tour__title', 'title', 'comment')
+    search_fields = ('author_name', 'tour__title', 'hotel__name', 'title', 'comment')

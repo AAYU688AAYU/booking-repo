@@ -1,15 +1,20 @@
 import json
 import urllib.request
+from datetime import date
 from decimal import Decimal
 from django.contrib.auth import get_user_model
-from django.db.models import Q, Avg, Sum, Count
+from django.db.models import Q, Avg, Sum, Count, Min
 from rest_framework import generics, status, permissions
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
 
-from .models import Destination, TourPackage, Booking, Review
+from .models import (
+    Destination, TourPackage, Hotel, RoomType,
+    SeasonalPricing, RoomInventory, GuideProfile, TourSlot,
+    Booking, Review
+)
 from .permissions import IsAdminRole, IsVendorRole, IsGuideRole
 from .serializers import (
     CustomTokenObtainPairSerializer,
@@ -19,6 +24,11 @@ from .serializers import (
     DestinationSerializer,
     TourPackageListSerializer,
     TourPackageDetailSerializer,
+    HotelListSerializer,
+    HotelDetailSerializer,
+    RoomTypeSerializer,
+    GuideProfileSerializer,
+    TourSlotSerializer,
     BookingSerializer,
     ReviewSerializer
 )
@@ -96,7 +106,6 @@ class GoogleAuthAPIView(APIView):
         role = serializer.validated_data.get('role', 'TRAVELLER')
 
         try:
-            # Verify credential token using Google's public endpoint
             url = f"https://oauth2.googleapis.com/tokeninfo?id_token={credential}"
             req = urllib.request.Request(url, headers={'User-Agent': 'VoyageCraft-Auth'})
             with urllib.request.urlopen(req, timeout=5) as response:
@@ -110,7 +119,6 @@ class GoogleAuthAPIView(APIView):
             avatar_url = payload.get('picture', '')
             google_id = payload.get('sub')
 
-            # Find or create user
             user, created = User.objects.get_or_create(
                 email=email,
                 defaults={
@@ -122,7 +130,6 @@ class GoogleAuthAPIView(APIView):
                 }
             )
 
-            # If user already existed, update avatar / google_id if missing
             if not created:
                 updated = False
                 if avatar_url and not user.avatar_url:
@@ -174,7 +181,6 @@ class TourPackageListAPIView(generics.ListAPIView):
     def get_queryset(self):
         queryset = TourPackage.objects.select_related('destination').all()
         
-        # Search query (title, country, city, description)
         search = self.request.query_params.get('search', '').strip()
         if search:
             queryset = queryset.filter(
@@ -185,27 +191,22 @@ class TourPackageListAPIView(generics.ListAPIView):
                 Q(short_description__icontains=search)
             )
 
-        # Destination filter
         destination_id = self.request.query_params.get('destination')
         if destination_id:
             queryset = queryset.filter(destination_id=destination_id)
 
-        # Region filter
         region = self.request.query_params.get('region')
         if region and region != 'All':
             queryset = queryset.filter(destination__region__iexact=region)
 
-        # Category filter
         category = self.request.query_params.get('category')
         if category and category != 'All':
             queryset = queryset.filter(category__iexact=category)
 
-        # Difficulty filter
         difficulty = self.request.query_params.get('difficulty')
         if difficulty and difficulty != 'All':
             queryset = queryset.filter(difficulty__iexact=difficulty)
 
-        # Price range
         min_price = self.request.query_params.get('min_price')
         if min_price:
             try:
@@ -220,22 +221,6 @@ class TourPackageListAPIView(generics.ListAPIView):
             except ValueError:
                 pass
 
-        # Duration range
-        min_days = self.request.query_params.get('min_days')
-        if min_days:
-            try:
-                queryset = queryset.filter(duration_days__gte=int(min_days))
-            except ValueError:
-                pass
-
-        max_days = self.request.query_params.get('max_days')
-        if max_days:
-            try:
-                queryset = queryset.filter(duration_days__lte=int(max_days))
-            except ValueError:
-                pass
-
-        # Featured / Trending
         featured = self.request.query_params.get('featured')
         if featured == 'true':
             queryset = queryset.filter(is_featured=True)
@@ -244,7 +229,6 @@ class TourPackageListAPIView(generics.ListAPIView):
         if trending == 'true':
             queryset = queryset.filter(is_trending=True)
 
-        # Ordering
         sort = self.request.query_params.get('sort', 'featured')
         if sort == 'price_low':
             queryset = queryset.order_by('price_per_person')
@@ -269,6 +253,140 @@ class TourPackageDetailAPIView(generics.RetrieveAPIView):
 
 
 # ----------------------------------------------------
+# Hotels & Accommodations Module Views
+# ----------------------------------------------------
+
+class HotelListCreateAPIView(generics.ListCreateAPIView):
+    serializer_class = HotelListSerializer
+
+    def get_permissions(self):
+        if self.request.method == 'POST':
+            return [IsVendorRole()]
+        return [permissions.AllowAny()]
+
+    def get_queryset(self):
+        queryset = Hotel.objects.select_related('destination').prefetch_related('room_types').annotate(
+            min_price_annotated=Min('room_types__base_price_per_night')
+        ).all()
+
+        search = self.request.query_params.get('search', '').strip()
+        if search:
+            queryset = queryset.filter(
+                Q(name__icontains=search) |
+                Q(destination__name__icontains=search) |
+                Q(destination__country__icontains=search) |
+                Q(address__icontains=search)
+            )
+
+        destination_id = self.request.query_params.get('destination')
+        if destination_id:
+            queryset = queryset.filter(destination_id=destination_id)
+
+        region = self.request.query_params.get('region')
+        if region and region != 'All':
+            queryset = queryset.filter(destination__region__iexact=region)
+
+        star_rating = self.request.query_params.get('star_rating')
+        if star_rating:
+            try:
+                queryset = queryset.filter(star_rating__gte=int(star_rating))
+            except ValueError:
+                pass
+
+        featured = self.request.query_params.get('featured')
+        if featured == 'true':
+            queryset = queryset.filter(is_featured=True)
+
+        return queryset.order_by('-is_featured', '-star_rating', 'id')
+
+    def perform_create(self, serializer):
+        serializer.save(owner=self.request.user)
+
+
+class HotelDetailAPIView(generics.RetrieveAPIView):
+    queryset = Hotel.objects.select_related('destination').prefetch_related('room_types__seasonal_prices', 'reviews').all()
+    serializer_class = HotelDetailSerializer
+    lookup_field = 'id'
+
+
+class RoomAvailabilityQuoteAPIView(APIView):
+    """
+    Real-time room availability calendar & dynamic pricing calculator.
+    GET /api/hotels/<hotel_id>/rooms/<room_id>/availability/?start_date=2026-12-01&end_date=2026-12-05&rooms=1
+    """
+    def get(self, request, hotel_id, room_id):
+        try:
+            room = RoomType.objects.get(id=room_id, hotel_id=hotel_id)
+        except RoomType.DoesNotExist:
+            return Response({'error': 'Room type not found for this hotel.'}, status=status.HTTP_404_NOT_FOUND)
+
+        start_str = request.query_params.get('start_date')
+        end_str = request.query_params.get('end_date')
+        requested_rooms = int(request.query_params.get('rooms', 1))
+
+        if not start_str or not end_str:
+            return Response({'error': 'Both start_date and end_date query parameters are required (YYYY-MM-DD).'}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            start_date = date.fromisoformat(start_str)
+            end_date = date.fromisoformat(end_str)
+        except ValueError:
+            return Response({'error': 'Invalid date format. Use YYYY-MM-DD.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        quote = room.calculate_stay_quote(start_date, end_date, requested_rooms)
+        return Response(quote, status=status.HTTP_200_OK)
+
+
+# ----------------------------------------------------
+# Tour Guides & Activities Views
+# ----------------------------------------------------
+
+class GuideListAPIView(generics.ListAPIView):
+    serializer_class = GuideProfileSerializer
+
+    def get_queryset(self):
+        queryset = GuideProfile.objects.select_related('user').prefetch_related('destinations').filter(is_verified=True)
+        destination_id = self.request.query_params.get('destination')
+        if destination_id:
+            queryset = queryset.filter(destinations__id=destination_id)
+        return queryset.order_by('-rating', '-experience_years')
+
+
+class GuideDetailAPIView(generics.RetrieveAPIView):
+    queryset = GuideProfile.objects.select_related('user').prefetch_related('destinations', 'slots').all()
+    serializer_class = GuideProfileSerializer
+    lookup_field = 'id'
+
+
+class TourSlotListCreateAPIView(generics.ListCreateAPIView):
+    serializer_class = TourSlotSerializer
+
+    def get_permissions(self):
+        if self.request.method == 'POST':
+            return [IsGuideRole()]
+        return [permissions.AllowAny()]
+
+    def get_queryset(self):
+        queryset = TourSlot.objects.select_related('tour', 'guide', 'guide__user').filter(is_active=True)
+        tour_id = self.request.query_params.get('tour')
+        if tour_id:
+            queryset = queryset.filter(tour_id=tour_id)
+        slot_date = self.request.query_params.get('date')
+        if slot_date:
+            try:
+                d = date.fromisoformat(slot_date)
+                queryset = queryset.filter(slot_date=d)
+            except ValueError:
+                pass
+        return queryset.order_by('slot_date', 'start_time')
+
+    def perform_create(self, serializer):
+        # If user has a GuideProfile, associate it automatically
+        guide_profile = getattr(self.request.user, 'guide_profile', None)
+        serializer.save(guide=guide_profile)
+
+
+# ----------------------------------------------------
 # Bookings Engine Views
 # ----------------------------------------------------
 
@@ -276,7 +394,9 @@ class BookingCreateListAPIView(generics.ListCreateAPIView):
     serializer_class = BookingSerializer
 
     def get_queryset(self):
-        queryset = Booking.objects.select_related('tour', 'tour__destination').order_by('-created_at')
+        queryset = Booking.objects.select_related(
+            'tour', 'tour__destination', 'room_type', 'room_type__hotel', 'tour_slot'
+        ).order_by('-created_at')
         user = self.request.user
         
         # If logged in as customer, default to their bookings
@@ -293,7 +413,6 @@ class BookingCreateListAPIView(generics.ListCreateAPIView):
         return queryset
 
     def perform_create(self, serializer):
-        # Automatically bind authenticated user if present
         if self.request.user and self.request.user.is_authenticated:
             serializer.save(user=self.request.user)
         else:
@@ -305,7 +424,9 @@ class BookingDetailByReferenceAPIView(generics.RetrieveAPIView):
     lookup_field = 'booking_reference'
 
     def get_queryset(self):
-        return Booking.objects.select_related('tour', 'tour__destination').all()
+        return Booking.objects.select_related(
+            'tour', 'tour__destination', 'room_type', 'room_type__hotel', 'tour_slot'
+        ).all()
 
 
 class TourReviewCreateAPIView(APIView):
@@ -327,7 +448,6 @@ class TourReviewCreateAPIView(APIView):
         serializer = ReviewSerializer(data=data)
         if serializer.is_valid():
             serializer.save()
-            # Recalculate tour average rating and count
             reviews = tour.reviews.all()
             avg_rating = reviews.aggregate(Avg('rating'))['rating__avg'] or 5.0
             tour.rating = round(avg_rating, 1)
@@ -341,6 +461,7 @@ class StatsOverviewAPIView(APIView):
     def get(self, request):
         destination_count = Destination.objects.count()
         tour_count = TourPackage.objects.count()
+        hotel_count = Hotel.objects.count()
         booking_count = Booking.objects.count()
         user_count = User.objects.count()
         avg_rating = TourPackage.objects.aggregate(Avg('rating'))['rating__avg'] or 4.9
@@ -349,6 +470,7 @@ class StatsOverviewAPIView(APIView):
         return Response({
             'total_destinations': destination_count,
             'total_tours': tour_count,
+            'total_hotels': hotel_count,
             'total_bookings': booking_count + 1420,
             'total_users': user_count + 3200,
             'average_rating': round(avg_rating, 2),
